@@ -23,6 +23,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+from stopwords import get_stopwords
+
 # ---------------------------------------------------------------------------
 # Page configuration
 # ---------------------------------------------------------------------------
@@ -115,6 +117,67 @@ def build_language_indexes(
     return indexes
 
 
+# ---------------------------------------------------------------------------
+# BM25 keyword index (per language)
+# ---------------------------------------------------------------------------
+# Tokenizer: lowercase + Unicode word boundaries. We keep digits because
+# CPV descriptions sometimes contain numeric tokens that are meaningful
+# (e.g. "Class 2 medical devices"). Stopwords are filtered per language.
+TOKEN_RE = re.compile(r"\w+", flags=re.UNICODE)
+
+
+def tokenize(text: str, lang: str) -> list[str]:
+    """Lowercase + word-tokenize + strip stopwords for the given language."""
+    if not text:
+        return []
+    stops = get_stopwords(lang)
+    return [
+        t for t in TOKEN_RE.findall(text.lower())
+        if len(t) > 1 and t not in stops
+    ]
+
+
+@st.cache_resource(show_spinner="Building BM25 keyword indexes…")
+def build_bm25_indexes(_catalogue: pd.DataFrame) -> dict[str, dict]:
+    """
+    Build one BM25 index per language. Each index is parallel to the
+    catalogue rows (one document per CPV code = the description in that
+    language). Returns a dict mapping language code to:
+        bm25  : a BM25Okapi instance
+        codes : array of CPV codes parallel to the BM25 corpus
+    """
+    from rank_bm25 import BM25Okapi
+    indexes: dict[str, dict] = {}
+    for lang in LANG_COLUMNS:
+        if lang not in _catalogue.columns:
+            continue
+        docs = _catalogue[lang].fillna("").tolist()
+        codes = _catalogue["code_clean"].tolist()
+        # Drop rows with empty descriptions in this language
+        pairs = [(c, d) for c, d in zip(codes, docs) if d.strip()]
+        if not pairs:
+            continue
+        kept_codes = [c for c, _ in pairs]
+        tokenized = [tokenize(d, lang) for _, d in pairs]
+        # rank_bm25 fails on empty docs, so substitute a single dummy token
+        tokenized = [t if t else ["_"] for t in tokenized]
+        indexes[lang] = {
+            "bm25": BM25Okapi(tokenized),
+            "codes": np.array(kept_codes),
+        }
+    return indexes
+
+
+def normalize_scores(scores: np.ndarray) -> np.ndarray:
+    """Min-max normalize to [0, 1]. Returns zeros if all scores are equal."""
+    if scores.size == 0:
+        return scores
+    lo, hi = float(scores.min()), float(scores.max())
+    if hi - lo < 1e-9:
+        return np.zeros_like(scores, dtype=np.float32)
+    return ((scores - lo) / (hi - lo)).astype(np.float32)
+
+
 @st.cache_resource(show_spinner="Loading multilingual embedding model…")
 def load_model():
     from sentence_transformers import SentenceTransformer
@@ -183,18 +246,22 @@ def classify(
     lang: str,
     model,
     indexes: dict[str, dict],
+    bm25_indexes: dict[str, dict],
     catalogue: pd.DataFrame,
     threshold: float,
+    alpha: float = 0.75,
 ) -> pd.DataFrame:
     """
-    Score the tender against CPV descriptions in ``lang`` only, then roll up
-    to 4-digit division. Returns one row per div4 above ``threshold``, sorted
-    by descending score, with descriptions in ``lang``.
+    Hybrid score = α·cosine + (1-α)·BM25, both normalized to [0, 1] within
+    the chosen language. Then roll up to 4-digit division. Returns one row
+    per div4 above ``threshold``, sorted by descending score, with descriptions
+    in ``lang``.
 
-    Codes mentioned literally in the source text (e.g. ``45213316-1``) are
-    extracted, validated against the catalogue, assigned a fixed score of
-    0.95, and surfaced in the results regardless of the threshold. They take
-    precedence over embedding matches for the same 4-digit division.
+    ``alpha`` controls the embedding/keyword balance:
+       1.0 = pure embeddings (semantic), 0.0 = pure BM25 (keyword), 0.6 default.
+
+    Codes mentioned literally in the source text get a fixed 0.95 score and
+    bypass the threshold entirely (same behaviour as before).
     """
     if lang not in indexes:
         return pd.DataFrame()
@@ -202,7 +269,6 @@ def classify(
     # ---- Step 1: explicit codes from the source ----
     extracted = extract_cpv_codes(text, catalogue)
 
-    # Look up localised descriptions for the extracted codes.
     code_to_desc = dict(zip(catalogue["code_clean"], catalogue[lang]))
     div_only = catalogue[catalogue["code_clean"] == catalogue["div4"]]
     div_to_desc = dict(zip(div_only["div4"], div_only[lang]))
@@ -210,45 +276,62 @@ def classify(
     extracted_rows = []
     extracted_div4s: set[str] = set()
     for item in extracted:
-        # Display the exact form as found, even if 8-digit, but record div4 for dedup.
         extracted_rows.append({
             "div4": item["div4"],
             "division_description": div_to_desc.get(item["div4"], ""),
             "score": 0.95,
+            "cosine": np.nan,
+            "bm25": np.nan,
             "top_code": item["raw"],
             "top_code_description": code_to_desc.get(item["code_8"], ""),
             "source": "📄 In document",
         })
         extracted_div4s.add(item["div4"])
 
-    # ---- Step 2: embedding-based ranking ----
+    # ---- Step 2a: embedding (cosine) scores ----
     bank = indexes[lang]
     qv = embed_query(model, text)
-    sims = bank["matrix"] @ qv  # cosine sim (both sides L2-normalised)
+    cos_sims = bank["matrix"] @ qv  # cosine sim, both sides L2-normalised
 
-    df = pd.DataFrame({"code": bank["codes"], "sim": sims})
-    df = df.loc[df.groupby("code")["sim"].idxmax()].reset_index(drop=True)
+    cos_df = pd.DataFrame({"code": bank["codes"], "cosine_raw": cos_sims})
+    cos_df = cos_df.loc[cos_df.groupby("code")["cosine_raw"].idxmax()].reset_index(drop=True)
+
+    # ---- Step 2b: BM25 keyword scores ----
+    if lang in bm25_indexes:
+        bm25_bank = bm25_indexes[lang]
+        query_tokens = tokenize(text, lang)
+        if query_tokens:
+            bm_raw = np.asarray(bm25_bank["bm25"].get_scores(query_tokens), dtype=np.float32)
+        else:
+            bm_raw = np.zeros(len(bm25_bank["codes"]), dtype=np.float32)
+        bm_df = pd.DataFrame({"code": bm25_bank["codes"], "bm25_raw": bm_raw})
+        bm_df = bm_df.loc[bm_df.groupby("code")["bm25_raw"].idxmax()].reset_index(drop=True)
+    else:
+        bm_df = pd.DataFrame({"code": cos_df["code"], "bm25_raw": 0.0})
+
+    # ---- Step 2c: merge and fuse ----
+    df = cos_df.merge(bm_df, on="code", how="left").fillna({"bm25_raw": 0.0})
+    df["cosine"] = normalize_scores(df["cosine_raw"].to_numpy())
+    df["bm25"] = normalize_scores(df["bm25_raw"].to_numpy())
+    df["score"] = (alpha * df["cosine"] + (1 - alpha) * df["bm25"]).astype(np.float32)
 
     code_to_div = dict(zip(catalogue["code_clean"], catalogue["div4"]))
     df["div4"] = df["code"].map(code_to_div)
     df = df.dropna(subset=["div4"])
 
-    idx = df.groupby("div4")["sim"].idxmax()
-    rolled = df.loc[idx].reset_index(drop=True).rename(
-        columns={"code": "top_code", "sim": "score"}
-    )
+    # Roll up to div4: keep the strongest descendant per division
+    idx = df.groupby("div4")["score"].idxmax()
+    rolled = df.loc[idx].reset_index(drop=True).rename(columns={"code": "top_code"})
     rolled["division_description"] = rolled["div4"].map(div_to_desc).fillna("")
     rolled["top_code_description"] = rolled["top_code"].map(code_to_desc).fillna("")
-    rolled["source"] = "🔍 Semantic match"
+    rolled["source"] = "🔍 Semantic + keyword"
 
-    # Apply threshold to embedding results only, and drop any div4 already
-    # covered by an extracted code (the explicit version wins).
     rolled = rolled[rolled["score"] >= threshold]
     rolled = rolled[~rolled["div4"].isin(extracted_div4s)]
 
-    # ---- Step 3: combine ----
-    columns = ["div4", "division_description", "score", "top_code",
-               "top_code_description", "source"]
+    # ---- Step 3: combine and order ----
+    columns = ["div4", "division_description", "score", "cosine", "bm25",
+               "top_code", "top_code_description", "source"]
     if extracted_rows:
         combined = pd.concat(
             [pd.DataFrame(extracted_rows, columns=columns), rolled[columns]],
@@ -381,9 +464,20 @@ def render_sidebar() -> dict:
         "Confidence threshold",
         min_value=0.20, max_value=0.90, value=0.45, step=0.01,
         help=(
-            "Minimum cosine similarity (0–1) for a CPV division to be returned. "
-            "Lower = more recall, more noise. Higher = fewer, more confident matches. "
-            "Typical sweet spot for single-language matching: 0.40–0.55."
+            "Minimum hybrid score (0–1) for a CPV division to be returned. "
+            "Lower = more recall. Higher = more precision. "
+            "Sweet spot: 0.40–0.55."
+        ),
+    )
+    alpha = st.sidebar.slider(
+        "Semantic vs. keyword balance (α)",
+        min_value=0.0, max_value=1.0, value=0.75, step=0.05,
+        help=(
+            "Weight given to embedding (semantic) similarity vs. BM25 (keyword) "
+            "matching: score = α·semantic + (1−α)·keyword. "
+            "1.0 = pure semantic (catches paraphrases). "
+            "0.0 = pure keyword (catches verbatim catalogue terms). "
+            "0.6 (default) handles both well in most cases."
         ),
     )
     max_results = st.sidebar.number_input(
@@ -394,12 +488,16 @@ def render_sidebar() -> dict:
     st.sidebar.divider()
     st.sidebar.markdown(
         "**Model**\n\n"
-        "`paraphrase-multilingual-mpnet-base-v2`\n\n"
+        "`paraphrase-multilingual-mpnet-base-v2` (semantic) + BM25 (keyword)\n\n"
         "Each tender is matched only against CPV descriptions in the **same "
-        "language**, so cross-language noise is eliminated. **No LLM is used "
-        "in classification — codes cannot be hallucinated.**"
+        "language**. **No LLM is used in classification — codes cannot be "
+        "hallucinated.**"
     )
-    return {"threshold": threshold, "max_results": int(max_results)}
+    return {
+        "threshold": threshold,
+        "alpha": alpha,
+        "max_results": int(max_results),
+    }
 
 
 def render_results(results: pd.DataFrame, max_results: int, lang: str) -> None:
@@ -415,6 +513,8 @@ def render_results(results: pd.DataFrame, max_results: int, lang: str) -> None:
 
     shown = results.head(max_results).copy()
     shown["score"] = shown["score"].round(4)
+    shown["cosine"] = shown["cosine"].round(3)
+    shown["bm25"] = shown["bm25"].round(3)
     shown.insert(0, "rank", range(1, len(shown) + 1))
     lang_name = LANG_INFO[lang][0]
     shown = shown.rename(
@@ -422,6 +522,8 @@ def render_results(results: pd.DataFrame, max_results: int, lang: str) -> None:
             "div4": "CPV (4-digit)",
             "division_description": f"Division ({lang_name})",
             "score": "Confidence",
+            "cosine": "Semantic",
+            "bm25": "Keyword",
             "top_code": "Best matching subcode",
             "top_code_description": f"Subcode ({lang_name})",
             "source": "Source",
@@ -552,6 +654,7 @@ def main() -> None:
     catalogue = load_cpv_catalogue()
     matrix, codes, langs = load_embeddings()
     indexes = build_language_indexes(matrix, codes, langs)
+    bm25_indexes = build_bm25_indexes(catalogue)
     model = load_model()
     detector, unsupported_detect = load_language_detector()
 
@@ -598,8 +701,10 @@ def main() -> None:
                 lang=chosen_lang,
                 model=model,
                 indexes=indexes,
+                bm25_indexes=bm25_indexes,
                 catalogue=catalogue,
                 threshold=settings["threshold"],
+                alpha=settings["alpha"],
             )
         render_results(results, settings["max_results"], chosen_lang)
 
