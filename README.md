@@ -1,6 +1,6 @@
 ---
 title: CPV Code Classifier
-emoji: 🇪🇺
+emoji: 📋
 colorFrom: blue
 colorTo: yellow
 sdk: docker
@@ -8,7 +8,7 @@ app_port: 8501
 pinned: false
 ---
 
-# 🇪🇺 CPV Code Classifier
+# 📋 CPV Code Classifier
 
 Predicts EU **Common Procurement Vocabulary** codes for a tender description, aggregated to the **4-digit division level**. Multilingual (all 24 official EU languages), deterministic, and **hallucination-free by construction** — the classifier ranks codes from the official CPV catalogue using cosine similarity over multilingual embeddings, with no LLM in the loop.
 
