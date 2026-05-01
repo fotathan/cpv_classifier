@@ -462,7 +462,7 @@ def render_sidebar() -> dict:
     st.sidebar.header("⚙️ Settings")
     threshold = st.sidebar.slider(
         "Confidence threshold",
-        min_value=0.20, max_value=0.90, value=0.45, step=0.01,
+        min_value=0.20, max_value=0.90, value=0.75, step=0.01,
         help=(
             "Minimum hybrid score (0–1) for a CPV division to be returned. "
             "Lower = more recall. Higher = more precision. "
